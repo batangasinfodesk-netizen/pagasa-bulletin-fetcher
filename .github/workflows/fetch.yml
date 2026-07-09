@@ -2,7 +2,7 @@ name: Fetch PAGASA Bulletins
 
 on:
   schedule:
-    # Runs every 30 minutes (UTC). Adjust as needed.
+    # Runs every 30 min (UTC).
     - cron: "*/30 * * * *"
   workflow_dispatch: {}  # allows manual trigger from the Actions tab
 
