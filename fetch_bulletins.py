@@ -59,6 +59,13 @@ def extract_storm_name(filename):
 
 
 def extract_year_from_pdf(content_bytes):
+    """
+    Reads the text inside the PDF and looks for the year specifically inside
+    an "Issued at ..." line (e.g. "Issued at 5:00 PM, 23 June 2026"), since
+    PAGASA bulletins also contain unrelated 20XX numbers such as template
+    revision codes (e.g. "MMSS-04 Rev.1 / 24-06-2024") which must be ignored.
+    Falls back to "Unknown Year" if nothing is found.
+    """
     try:
         with pdfplumber.open(io.BytesIO(content_bytes)) as pdf:
             text = ""
@@ -67,9 +74,26 @@ def extract_year_from_pdf(content_bytes):
                 text += page_text
                 if text:
                     break
-        match = re.search(r"\b(20\d{2})\b", text)
-        if match:
-            return match.group(1)
+
+        # Priority 1: year on the same line as "Issued at"
+        issued_match = re.search(r"Issued at[^\n]*?\b(20\d{2})\b", text, re.IGNORECASE)
+        if issued_match:
+            return issued_match.group(1)
+
+        # Priority 2: year next to a month name (safer than a bare number)
+        month_match = re.search(
+            r"\b(January|February|March|April|May|June|July|August|September|"
+            r"October|November|December)\s+(20\d{2})\b",
+            text,
+            re.IGNORECASE,
+        )
+        if month_match:
+            return month_match.group(2)
+
+        # Last resort: any 20XX number on the page
+        fallback_match = re.search(r"\b(20\d{2})\b", text)
+        if fallback_match:
+            return fallback_match.group(1)
     except Exception as e:
         print(f"WARNING: could not extract year from PDF text: {e}")
     return "Unknown Year"
