@@ -1,184 +1,50 @@
-import os
-import io
-import re
-import sys
-import requests
-import pdfplumber
-from bs4 import BeautifulSoup
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+"""
+Run this locally to generate a new GDRIVE_REFRESH_TOKEN.
 
-URL = "https://pubfiles.pagasa.dost.gov.ph/tamss/weather/bulletin/"
+1. pip install google-auth-oauthlib
+2. Fill in CLIENT_ID and CLIENT_SECRET below (from Google Cloud Console > Clients > Desktop client 1)
+3. Run: python get_refresh_token.py
+4. A browser window will open - log in with the Google account that owns the Drive folder,
+   and approve access.
+5. The script will print a new refresh token. Copy it into the GDRIVE_REFRESH_TOKEN secret
+   in GitHub (Settings > Secrets and variables > Actions).
+"""
+
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+# --- Fill these in ---
+CLIENT_ID = "941704318073-l6e5rlgepajolsrr0jnvps3hhfmo82i2.apps.googleusercontent.com"
+CLIENT_SECRET = "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"
+# ----------------------
+
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-ROOT_FOLDER_ID = (os.environ.get("GDRIVE_FOLDER_ID") or "").strip()
-CLIENT_ID = os.environ.get("GDRIVE_CLIENT_ID")
-CLIENT_SECRET = os.environ.get("GDRIVE_CLIENT_SECRET")
-REFRESH_TOKEN = os.environ.get("GDRIVE_REFRESH_TOKEN")
-
-if not all([ROOT_FOLDER_ID, CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
-    print("Missing one or more required env vars: GDRIVE_FOLDER_ID, GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN")
-    sys.exit(1)
-
-_folder_cache = {}
-
-
-def get_drive_service():
-    creds = Credentials(
-        token=None,
-        refresh_token=REFRESH_TOKEN,
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
-        token_uri="https://oauth2.googleapis.com/token",
-        scopes=SCOPES,
-    )
-    return build("drive", "v3", credentials=creds)
-
-
-def get_pdf_links():
-    r = requests.get(URL, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    links = []
-    for a in soup.find_all("a"):
-        href = a.get("href", "")
-        if href.lower().endswith(".pdf"):
-            if href.startswith("http"):
-                links.append(href)
-            else:
-                links.append(URL + href.lstrip("/"))
-    return links
-
-
-def extract_storm_name(filename):
-    match = re.search(r"_([A-Za-z]+)\.pdf$", filename, re.IGNORECASE)
-    if match:
-        return match.group(1).capitalize()
-    return "Unsorted"
-
-
-def extract_year_from_pdf(content_bytes):
-    """
-    Reads the text inside the PDF and looks for the year specifically inside
-    an "Issued at ..." line (e.g. "Issued at 5:00 PM, 23 June 2026"), since
-    PAGASA bulletins also contain unrelated 20XX numbers such as template
-    revision codes (e.g. "MMSS-04 Rev.1 / 24-06-2024") which must be ignored.
-    Falls back to "Unknown Year" if nothing is found.
-    """
-    try:
-        with pdfplumber.open(io.BytesIO(content_bytes)) as pdf:
-            text = ""
-            for page in pdf.pages[:2]:
-                page_text = page.extract_text() or ""
-                text += page_text
-                if text:
-                    break
-
-        # Priority 1: year on the same line as "Issued at"
-        issued_match = re.search(r"Issued at[^\n]*?\b(20\d{2})\b", text, re.IGNORECASE)
-        if issued_match:
-            return issued_match.group(1)
-
-        # Priority 2: year next to a month name (safer than a bare number)
-        month_match = re.search(
-            r"\b(January|February|March|April|May|June|July|August|September|"
-            r"October|November|December)\s+(20\d{2})\b",
-            text,
-            re.IGNORECASE,
-        )
-        if month_match:
-            return month_match.group(2)
-
-        # Last resort: any 20XX number on the page
-        fallback_match = re.search(r"\b(20\d{2})\b", text)
-        if fallback_match:
-            return fallback_match.group(1)
-    except Exception as e:
-        print(f"WARNING: could not extract year from PDF text: {e}")
-    return "Unknown Year"
-
-
-def get_or_create_folder(drive, name, parent_id):
-    cache_key = (parent_id, name)
-    if cache_key in _folder_cache:
-        return _folder_cache[cache_key]
-
-    safe_name = name.replace("'", "\\'")
-    query = (
-        f"name = '{safe_name}' and '{parent_id}' in parents "
-        "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    )
-    resp = drive.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
-    files = resp.get("files", [])
-    if files:
-        folder_id = files[0]["id"]
-    else:
-        metadata = {
-            "name": name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [parent_id],
-        }
-        folder = drive.files().create(body=metadata, fields="id").execute()
-        folder_id = folder["id"]
-        print(f"Created folder: {name} (under parent {parent_id})")
-
-    _folder_cache[cache_key] = folder_id
-    return folder_id
-
-
-def file_exists_in_folder(drive, filename, folder_id):
-    safe_name = filename.replace("'", "\\'")
-    query = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
-    resp = drive.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
-    return len(resp.get("files", [])) > 0
-
-
-def upload_to_drive(drive, filename, content_bytes, folder_id):
-    metadata = {"name": filename, "parents": [folder_id]}
-    media = MediaIoBaseUpload(io.BytesIO(content_bytes), mimetype="application/pdf", resumable=False)
-    drive.files().create(body=metadata, media_body=media, fields="id").execute()
-
-
-def verify_folder_access(drive):
-    try:
-        folder = drive.files().get(fileId=ROOT_FOLDER_ID, fields="id, name, mimeType").execute()
-        print(f"DEBUG: Root folder found -> name={folder.get('name')!r}")
-    except Exception as e:
-        print(f"DEBUG: Could not access root folder with ID {ROOT_FOLDER_ID!r}: {e}")
-        raise
+CLIENT_CONFIG = {
+    "installed": {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": ["http://localhost"],
+    }
+}
 
 
 def main():
-    drive = get_drive_service()
-    verify_folder_access(drive)
-    links = get_pdf_links()
-    print(f"Found {len(links)} PDF(s) on PAGASA page.")
+    flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, SCOPES)
+    # access_type=offline + prompt=consent ensures Google issues a refresh token
+    # even if this app has been authorized before.
+    creds = flow.run_local_server(
+        port=0,
+        access_type="offline",
+        prompt="consent",
+    )
 
-    new_count = 0
-    for link in links:
-        fname = requests.utils.unquote(link.split("/")[-1])
-        storm_name = extract_storm_name(fname)
-
-        print(f"Downloading: {fname}")
-        r = requests.get(link, timeout=30)
-        r.raise_for_status()
-        content = r.content
-
-        year = extract_year_from_pdf(content)
-
-        year_folder_id = get_or_create_folder(drive, year, ROOT_FOLDER_ID)
-        storm_folder_id = get_or_create_folder(drive, storm_name, year_folder_id)
-
-        if file_exists_in_folder(drive, fname, storm_folder_id):
-            print(f"Already exists, skipping: {year}/{storm_name}/{fname}")
-            continue
-
-        upload_to_drive(drive, fname, content, storm_folder_id)
-        print(f"Uploaded: {year}/{storm_name}/{fname}")
-        new_count += 1
-
-    print(f"Done. {new_count} new file(s) uploaded.")
+    print("\n" + "=" * 60)
+    print("SUCCESS. Copy the refresh token below into your GDRIVE_REFRESH_TOKEN GitHub secret:")
+    print("=" * 60)
+    print(creds.refresh_token)
+    print("=" * 60)
 
 
 if __name__ == "__main__":
